@@ -581,12 +581,41 @@ class SSGeExtractor(BaseExtractor):
         amount = jl.get("price_amount")
         currency = jl.get("price_currency")
         if not (amount and currency):
-            og_amt = meta(soup, "product:price:amount")
-            og_cur = meta(soup, "product:price:currency")
-            if og_amt and not amount:
-                amount = extract_first_number(og_amt)
-            if og_cur and not currency:
-                currency = og_cur
+            # попробуем вытащить цену из встроенного JSON-блока "price":{...}
+            m_price = re.search(r'"price":(\{[^{}]+\})', html)
+            price_obj = None
+            if m_price:
+                try:
+                    price_obj = json.loads(m_price.group(1))
+                except Exception:
+                    price_obj = None
+            if price_obj:
+                cur_map = {1: "GEL", 2: "USD", 3: "EUR"}
+                cur_type = price_obj.get("currencyType")
+                currency = cur_map.get(cur_type)
+                if currency == "USD":
+                    amount = price_obj.get("priceUsd")
+                    unit_price = price_obj.get("unitPriceUsd") or 0
+                elif currency == "GEL":
+                    amount = price_obj.get("priceGeo")
+                    unit_price = price_obj.get("unitPriceGeo") or 0
+                elif currency == "EUR":
+                    amount = price_obj.get("priceEur")
+                    unit_price = price_obj.get("unitPriceEur") or 0
+                else:
+                    unit_price = 0
+                if amount and unit_price and not jl.get("area_m2"):
+                    try:
+                        jl["area_m2"] = int(round(float(amount) / float(unit_price)))
+                    except Exception:
+                        pass
+            if not (amount and currency):
+                og_amt = meta(soup, "product:price:amount")
+                og_cur = meta(soup, "product:price:currency")
+                if og_amt and not amount:
+                    amount = extract_first_number(og_amt)
+                if og_cur and not currency:
+                    currency = og_cur
         if not (amount and currency):
             amount, currency = _pick_total_price(text_all)
 
@@ -603,11 +632,21 @@ class SSGeExtractor(BaseExtractor):
             if od and len(od) > 50:
                 desc = od.strip()
 
-        # Attributes
+        # Attributes: берём только значения из <li> без зачёркивания/классов "нет"
         attributes = set()
-        for kw in (self.RU_FEATURES + self.KA_FEATURES + self.EN_FEATURES):
-            if re.search(rf"\b{re.escape(kw)}\b", text_all, flags=re.I):
-                attributes.add(kw)
+        feat_words = self.RU_FEATURES + self.KA_FEATURES + self.EN_FEATURES
+        for li in soup.find_all("li"):
+            cls = " ".join(li.get("class", []))
+            style = li.get("style", "")
+            if re.search(r"no|not|нет|false|absent|unavailable|close", cls, flags=re.I):
+                continue
+            if "line-through" in style.lower() or li.find(["s", "del"]):
+                continue
+            txt = textify(li)
+            for kw in feat_words:
+                if re.fullmatch(rf"\s*{re.escape(kw)}\s*", txt, flags=re.I):
+                    attributes.add(kw)
+                    break
 
         # Numbers / areas
         def find_int(patts: List[str]) -> Optional[int]:
@@ -636,26 +675,15 @@ class SSGeExtractor(BaseExtractor):
                     return extract_first_number(m.group(1))
             return None
 
-        # Площадь: ТОЛЬКО по меткам или JSON-LD (убираем опасный min/max фоллбек)
+        # Площадь: только по явным меткам или JSON/JSON-LD (без эвристик)
         area_m2 = jl.get("area_m2") or area_by_labels([
             "Площадь дома","Площадь квартиры","Общая площадь","Жилая площадь",
             "House area","Apartment area","Total area",
             "სახლის ფართი","ბინის ფართი","საერთო ფართი"
         ])
-        land_area_m2 = area_by_labels(["Площадь участка","Площадь земли","Участок","Land area","Lot area","ეზოს ფართი"])
-        if area_m2 is None or land_area_m2 is None:
-            ms = re.findall(rf"(\d[\d\s,\.]*)\s*{MEASURE_M2_RU_KA_EN}", text_all, flags=re.I)
-            nums = []
-            for x in ms:
-                n = extract_first_number(x)
-                if n and n not in nums:
-                    nums.append(n)
-            if len(nums) >= 2:
-                small, big = min(nums), max(nums)
-                if area_m2 is None: area_m2 = small
-                if land_area_m2 is None and big >= small: land_area_m2 = big
-            elif len(nums) == 1 and area_m2 is None:
-                area_m2 = nums[0]
+        land_area_m2 = area_by_labels([
+            "Площадь участка","Площадь земли","Участок","Land area","Lot area","ეზოს ფართი"
+        ])
 
         # Location + address + floors
         location, addr_line = self._extract_address(soup, text_all)
@@ -677,13 +705,9 @@ class SSGeExtractor(BaseExtractor):
         photo_urls.extend(json_imgs_cap)
         ordered_photos = uniq_keep_order([u for u in photo_urls if is_good_image_url(u)])[:10]
 
-        # Phones: из ссылок, текста, JSON
-        phones = _phones_from_text(" ".join(a.get("href","") for a in soup.select('a[href^="tel:"]')))
+        # Phones: берём только из ссылок и видимого текста
+        phones = _phones_from_text(" ".join(a.get("href", "") for a in soup.select('a[href^="tel:"]')))
         phones.extend(_phones_from_text(text_all))
-        for blob in json_blobs_cap:
-            for s in _flatten_strings(blob):
-                if any(ch.isdigit() for ch in s):
-                    phones.extend(_phones_from_text(s))
         phones = uniq_keep_order(phones)
 
         listing = Listing(
@@ -1025,14 +1049,15 @@ def find_m2_values(text: str) -> List[int]:
 
 def force_myhome_ru(url: str) -> str:
     """
-    Делает русскую версию ссылки myhome.ge.
+    Делает русскую версию ссылки myhome.ge или home.ss.ge.
     - /pr/...        -> /ru/pr/...
     - /ka/pr/...     -> /ru/pr/...
     - /en/pr/...     -> /ru/pr/...
     Остальные части (query/fragment) сохраняем.
     """
     p = urlparse(url)
-    if "myhome.ge" not in p.netloc.lower():
+    host = p.netloc.lower()
+    if "myhome.ge" not in host and "home.ss.ge" not in host:
         return url
 
     path = p.path or "/"
