@@ -165,15 +165,18 @@ def db_stats_window(since_ts: int) -> Dict[str, int]:
 # ============== Вспомогательные ==============
 
 def ensure_ru_myhome(url: str) -> str:
+    """Нормализует ссылки myhome.ge и home.ss.ge на русскую версию."""
     u = urlsplit(url)
-    if "myhome.ge" in u.netloc:
+    host = u.netloc
+    if "myhome.ge" in host or "home.ss.ge" in host:
         path = u.path
         if not path.startswith("/ru/"):
             if path.startswith(("/ka/", "/en/", "/az/", "/am/")):
                 path = "/ru/" + path.split("/", 2)[2]
             else:
                 path = "/ru" + path
-        return urlunsplit((u.scheme, u.netloc, path, u.query, u.fragment))
+        path = re.sub(r"/{2,}", "/", path)
+        return urlunsplit((u.scheme, host, path, u.query, u.fragment))
     return url
 
 def pick_first_url(text: str) -> Optional[str]:
@@ -351,7 +354,7 @@ async def on_link(m: Message):
         text = (
             f"⚠️ Такая ссылка уже публиковалась.\n\n"
             f"<b>{row['title'] or 'Объявление'}</b>\n"
-            f"{(row['summary_ru'] or '')}\n\n{row['canonical_url']}"
+            f"{(row['summary_ru'] or '')}"
         )
         await m.answer(text, reply_markup=build_keyboard(int(row["id"]), exists_posted=True))
         return
@@ -388,8 +391,6 @@ async def on_link(m: Message):
             sr.photos,
             client,
             f"<b>{sr.title or ''}</b>\n{sr.summary_ru}"
-            + (f"\n\n📞 {' • '.join(sr.phones[:3])}" if sr.phones else "")
-            + f"\n\n{sr.canonical_url}"
         )
     if album:
         try:
@@ -399,8 +400,6 @@ async def on_link(m: Message):
 
     text = (
         f"<b>{sr.title or 'Объявление'}</b>\n{sr.summary_ru}"
-        + (f"\n\n📞 {' • '.join(sr.phones[:3])}" if sr.phones else "")
-        + f"\n\n{sr.canonical_url}"
     )
     await m.answer(text, reply_markup=build_keyboard(row_id, exists_posted))
 
@@ -434,8 +433,6 @@ async def on_send(cb: CallbackQuery):
             sr.photos,
             client,
             f"<b>{sr.title or ''}</b>\n{sr.summary_ru}"
-            + (f"\n\n📞 {' • '.join(sr.phones[:3])}" if sr.phones else "")
-            + f"\n\n{sr.canonical_url}"
         )
     if not album:
         await cb.message.answer("Нет фото для отправки."); await cb.answer(); return
