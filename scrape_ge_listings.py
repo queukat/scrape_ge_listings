@@ -486,6 +486,8 @@ class SSGeExtractor(BaseExtractor):
         "alarm system","storage","telephone","tv","washing machine","pool"
     ]
 
+    PHONE_BLACKLIST = {"+995322121661"}
+
     def _jsonld_fill(self, jlds: List[Dict[str, Any]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         photos = []
@@ -567,7 +569,8 @@ class SSGeExtractor(BaseExtractor):
             raise ScrapeError("Failed to load page")
 
         soup = BeautifulSoup(html, "lxml")
-        text_all = textify(soup)
+        main = soup.find("main") or soup
+        text_all = textify(main)
 
         jlds = pick_json_ld(html)
         jl = self._jsonld_fill(jlds) if jlds else {}
@@ -705,10 +708,10 @@ class SSGeExtractor(BaseExtractor):
         photo_urls.extend(json_imgs_cap)
         ordered_photos = uniq_keep_order([u for u in photo_urls if is_good_image_url(u)])[:10]
 
-        # Phones: берём только из ссылок и видимого текста
-        phones = _phones_from_text(" ".join(a.get("href", "") for a in soup.select('a[href^="tel:"]')))
+        # Phones: берём только из ссылок и видимого текста в основной части страницы
+        phones = _phones_from_text(" ".join(a.get("href", "") for a in main.select('a[href^="tel:"]')))
         phones.extend(_phones_from_text(text_all))
-        phones = uniq_keep_order(phones)
+        phones = [p for p in uniq_keep_order(phones) if p not in self.PHONE_BLACKLIST]
 
         listing = Listing(
             url=self.url,
@@ -798,7 +801,8 @@ class MyHomeExtractor(BaseExtractor):
             raise ScrapeError("Failed to load page")
 
         soup = BeautifulSoup(html, "lxml")
-        text_all = textify(soup)
+        main = soup.find("main") or soup
+        text_all = textify(main)
 
         # JSON-LD
         jlds = pick_json_ld(html)
@@ -962,8 +966,8 @@ class MyHomeExtractor(BaseExtractor):
         resolved = [absolutize(self._resolve_next_image(u), self.url) for u in cand]
         photos_ord = uniq_keep_order([u for u in resolved if is_good_image_url(u) and not re.search(r'(?:_thumb|_blur|google_map)', u)])[:10]
 
-        # Phones: tel: + текст + JSON
-        phones = _phones_from_text(" ".join(a.get("href","") for a in soup.select('a[href^="tel:"]')))
+        # Phones: tel: + текст + JSON (только из основной части страницы)
+        phones = _phones_from_text(" ".join(a.get("href","") for a in main.select('a[href^="tel:"]')))
         phones.extend(_phones_from_text(text_all))
         for blob in captured_json_blobs:
             for s in _flatten_strings(blob):
