@@ -208,16 +208,18 @@ def build_summary_ru(data: Dict[str, Any]) -> str:
         lines.append(str(data["address_line"]))
     second = []
     if rooms:
-        second.append(f"{rooms} Комнаты")
-    if beds:
-        second.append(f"{beds} Спальня")
+        second.append(f"{rooms} Комнаты" if int(rooms) != 1 else "1 Комната")
+    if beds is not None:
+        second.append(f"{beds} Спальня" if int(beds) == 1 else f"{beds} Спальни")
     if second:
         lines.append(", ".join(second))
     third = []
     if floor and floors:
         third.append(f"{floor}/{floors} Этажей")
     elif floor:
-        third.append(f"{floor} этаж")
+        third.append(f"{floor} Этаж")
+    elif floors:
+        third.append(f"Этажность: {floors}")
     if area:
         third.append(f"{area} м²")
     if third:
