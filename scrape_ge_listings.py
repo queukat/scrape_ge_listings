@@ -41,6 +41,14 @@ try:
 except Exception:
     PIL_OK = False
 
+# optional translation (Georgian -> Russian)
+try:
+    from deep_translator import GoogleTranslator  # type: ignore
+    _gt = GoogleTranslator(source="auto", target="ru")
+    GT_OK = True
+except Exception:
+    GT_OK = False
+
 # ---------- Utils ----------
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -148,6 +156,19 @@ def is_good_image_url(u: str) -> bool:
     if any(bad in host for bad in SKIP_IMG_HOST_SUBSTR):
         return False
     return bool(re.search(r"\.(?:jpe?g|png|webp)(?:\?.*)?$", u, flags=re.I))
+
+_RE_GEORGIAN = re.compile(r"[ა-ჰ]")
+
+def to_ru(text: Optional[str]) -> Optional[str]:
+    """Translate Georgian text to Russian if translator is available."""
+    if not text:
+        return text
+    if GT_OK and _RE_GEORGIAN.search(text):
+        try:
+            return _gt.translate(text)
+        except Exception:
+            return text
+    return text
 
 # ---------- Phones ----------
 _RE_PHONE = re.compile(
@@ -688,38 +709,105 @@ class SSGeExtractor(BaseExtractor):
             "Площадь участка","Площадь земли","Участок","Land area","Lot area","ეზოს ფართი"
         ])
 
+        # Надёжный fallback: берём РОВНО числа перед m²
+        if area_m2 is None or land_area_m2 is None:
+            m2s = find_m2_values(text_all)
+            if m2s:
+                if area_m2 is None:
+                    area_m2 = m2s[0]
+                if land_area_m2 is None and len(m2s) > 1:
+                    land_area_m2 = m2s[1]
+        if land_area_m2 == area_m2:
+            land_area_m2 = None
+
         # Location + address + floors
-        location, addr_line = self._extract_address(soup, text_all)
+        location = jl.get("location") or None
+        loc_text, addr_line = self._extract_address(soup, text_all)
         if not location:
-            location = jl.get("location")
+            location = loc_text
+        raw_addr = addr_line or self._parse_ru_ka_address_from_text(text_all)
+        address_line = to_ru(raw_addr) if raw_addr else None
+
         floor, floors_total = self._parse_floors(text_all)
+
+        # Досбор этажности из JSON-пакетов, если нашли
+        try:
+            for blob in json_blobs_cap:
+                strs = json.dumps(blob, ensure_ascii=False)
+                m1 = re.search(r'"(?:floor|floorNumber)"\s*:\s*(\d+)', strs)
+                m2 = re.search(r'"(?:totalFloors|numberOfFloors|floorsTotal)"\s*:\s*(\d+)', strs)
+                if m1 and not floor:
+                    floor = int(m1.group(1))
+                if m2 and not floors_total:
+                    floors_total = int(m2.group(1))
+                if floor and floors_total:
+                    break
+        except Exception:
+            pass
 
         # Photos (добавим снимки из рендера + ограничим 10 шт.)
         photo_urls: List[str] = []
         if jl.get("photos"):
             photo_urls.extend([absolutize(u, self.url) for u in jl["photos"]])
-        if not photo_urls:
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or ""
-                if src and "ss.ge" in urlparse(absolutize(src, self.url)).netloc:
-                    photo_urls.append(absolutize(src, self.url))
         # дом + JSON от рендера
         photo_urls.extend(dom_imgs_cap)
         photo_urls.extend(json_imgs_cap)
-        ordered_photos = uniq_keep_order([u for u in photo_urls if is_good_image_url(u)])[:10]
+        # OG
+        og_img = meta(soup, "og:image")
+        if og_img:
+            photo_urls.append(og_img)
+        # простой fallback
+        if not photo_urls:
+            for img in soup.find_all("img"):
+                src = img.get("src") or img.get("data-src") or ""
+                if src:
+                    photo_urls.append(src)
 
-        # Phones: берём только из ссылок и видимого текста в основной части страницы
+        def _resolve_next_image(u: str) -> str:
+            if "/_next/image" in u:
+                try:
+                    qs = parse_qs(urlparse(u).query).get("url")
+                    if qs:
+                        return unquote(qs[0])
+                except Exception:
+                    pass
+            return u
+
+        resolved = [absolutize(_resolve_next_image(u), self.url) for u in photo_urls]
+        ordered_photos = uniq_keep_order([u for u in resolved if is_good_image_url(u) and not re.search(r'(?:_thumb|_blur|google_map)', u)])[:10]
+
+        # Phones: tel: + текст + JSON (только из основной части страницы)
         phones = _phones_from_text(" ".join(a.get("href", "") for a in main.select('a[href^="tel:"]')))
         phones.extend(_phones_from_text(text_all))
+        for blob in json_blobs_cap:
+            # 1) свободные строки
+            for s in _flatten_strings(blob):
+                if any(ch.isdigit() for ch in s):
+                    phones.extend(_phones_from_text(s))
+            # 2) явные поля phone_number / phoneNumber / phone
+            try:
+                if isinstance(blob, dict):
+                    candidates: List[Optional[str]] = []
+                    data = blob.get("data") if isinstance(blob.get("data"), dict) else None
+                    if isinstance(data, dict):
+                        candidates += [data.get("phone_number"), data.get("phoneNumber"), data.get("phone")]
+                    candidates += [blob.get("phone_number"), blob.get("phoneNumber"), blob.get("phone")]
+                    for val in candidates:
+                        if val:
+                            ph = _normalize_ge_phone(str(val))
+                            if ph:
+                                phones.append(ph)
+            except Exception:
+                pass
         phones = [p for p in uniq_keep_order(phones) if p not in self.PHONE_BLACKLIST]
 
         listing = Listing(
             url=self.url,
-            source="home.ss.ge",
+            source="home.ss.ge",  # для единообразия источника из рендера SS на поддомене home.ss.ge
             listing_id=listing_id,
             title=title,
             location=location,
-            address_line=addr_line,
+            address_line=address_line,
             price=Price(amount=amount, currency=currency),
             area_m2=area_m2,
             land_area_m2=land_area_m2,
@@ -740,6 +828,8 @@ class SSGeExtractor(BaseExtractor):
 
 class MyHomeExtractor(BaseExtractor):
     """Extracts from myhome.ge pages (JS-heavy SPA)."""
+
+    PHONE_BLACKLIST = {"+995322800015", "+995507796845"}
 
     def _resolve_next_image(self, u: str) -> str:
         if "/_next/image" in u:
@@ -762,7 +852,7 @@ class MyHomeExtractor(BaseExtractor):
 
         # RU: «ул./улица/пр-т/проспект … 37»
         m = re.search(
-            r"(?:ул\.?|улица|просп(?:\.|ект)?|пр-т|пер\.?|переулок|ш(?:\.|оссе)?)\s*[А-ЯЁа-яё\.\- ]+?\s*(\d+[А-Яа-яA-Za-z\-\/]?)\b(?!\s*\д)",
+            r"(?:ул\.?|улица|просп(?:\.|ект)?|пр-т|пер\.?|переулок|ш(?:\.|оссе)?)\s*[А-ЯЁа-яё\.\- ]+?\s*(\d+[А-Яа-яA-Za-z\-\/]?)\b(?!\s*\d)",
             text_all, flags=re.I
         )
         return m.group(0).strip() if m else None
@@ -809,6 +899,7 @@ class MyHomeExtractor(BaseExtractor):
         title = None
         location = None
         price_amount, price_currency = None, None
+        description = None
         photos: List[str] = []
 
         for node in jlds:
@@ -830,29 +921,49 @@ class MyHomeExtractor(BaseExtractor):
             elif isinstance(imgs, str):
                 photos.append(imgs)
 
-        # __NEXT_DATA__ – часто содержит массив images
+        # __NEXT_DATA__ – часто содержит массив images и поля цены/адреса
         nd_tag = soup.find('script', {'id': '__NEXT_DATA__'})
-        address_line = None
+        raw_addr = None
         if nd_tag:
             try:
                 nd = json.loads(nd_tag.string or nd_tag.text or '{}')
-                s = nd
+                s: Any = nd
                 for k in ["props", "pageProps", "dehydratedState", "queries"]:
                     s = s.get(k, {})
+                st: Dict[str, Any] = {}
                 if isinstance(s, list) and s:
-                    st = s[0].get("state", {}).get("data", {}).get("data", {}).get("statement", {})
-                    # фото
-                    for img in st.get("images", []) or []:
-                        u = (img.get("large") or img.get("thumb") or "").strip()
-                        if u: photos.append(u)
-                    # адрес прямо из JSON
-                    for key in ("address", "addressName", "addressText", "streetAddress"):
-                        val = st.get(key)
-                        if isinstance(val, str) and re.search(r"(ქუჩა|გამზირი|პროსპექტი|ул|улица|просп|пер|шос)", val,
-                                                              re.I):
-                            address_line = val.strip()
-                            break
-                    location = location or st.get("locationName") or st.get("districtName") or None
+                    st = s[0].get("state", {}).get("data", {}).get("data", {}).get("statement", {}) or {}
+                # фото
+                for img in st.get("images", []) or []:
+                    u = (img.get("large") or img.get("thumb") or "").strip()
+                    if u:
+                        photos.append(u)
+                # адрес
+                for key in ("address", "addressName", "addressText", "streetAddress"):
+                    val = st.get(key)
+                    if isinstance(val, str) and val.strip():
+                        raw_addr = val.strip()
+                        break
+                # локация
+                location = location or st.get("locationName") or st.get("districtName") or None
+                # цена
+                price_map = st.get("price") if isinstance(st.get("price"), dict) else {}
+                for cid, cur in (("2", "USD"), ("3", "EUR"), ("1", "GEL")):
+                    data = price_map.get(cid, {}) if price_map else {}
+                    amt = data.get("price_total") or data.get("priceTotal") or data.get("total")
+                    if isinstance(amt, (int, float)):
+                        price_amount, price_currency = int(amt), cur
+                        break
+                if not price_amount:
+                    amt = st.get("total_price") or st.get("price_total") or st.get("price")
+                    cid = st.get("currency_id") or st.get("currencyId")
+                    cur = {1: "GEL", 2: "USD", 3: "EUR"}.get(cid)
+                    if isinstance(amt, (int, float)) and cur:
+                        price_amount, price_currency = int(amt), cur
+                if not description:
+                    descr = st.get("comment") or st.get("description")
+                    if isinstance(descr, str):
+                        description = to_ru(descr.strip())
             except Exception:
                 pass
 
@@ -865,7 +976,8 @@ class MyHomeExtractor(BaseExtractor):
             price_amount = extract_first_number(og_amt)
         if (not price_currency) and og_cur:
             price_currency = og_cur
-        # --- Предпочитаем USD, затем EUR, затем GEL (MyHome часто отдаёт GEL) ---
+
+        # --- Предпочитаем USD, затем EUR, затем GEL ---
         def pick_best_price(text: str) -> Tuple[Optional[int], Optional[str]]:
             pairs = re.findall(r"([\d\s,\.]+)\s*(₾|\$|€|GEL|USD|EUR)", text, flags=re.I)
             seen: Dict[str, int] = {}
@@ -874,11 +986,11 @@ class MyHomeExtractor(BaseExtractor):
                 cur = normalize_price(cur_raw)[1]
                 if amt and cur and cur not in seen:
                     seen[cur] = amt
-            for pref in ("USD","EUR","GEL"):
+            for pref in ("USD", "EUR", "GEL"):
                 if pref in seen:
                     return seen[pref], pref
             return None, None
-        if True:
+        if price_amount is None or price_currency is None:
             cand_amt, cand_cur = pick_best_price(text_all)
             if cand_amt and cand_cur:
                 price_amount, price_currency = cand_amt, cand_cur
@@ -891,7 +1003,7 @@ class MyHomeExtractor(BaseExtractor):
             listing_id = mi.group(1)
 
         # rooms / bedrooms & areas
-        def find_int(patts: List[str]) -> Optional[int]:
+        def find_int2(patts: List[str]) -> Optional[int]:
             for pat in patts:
                 m = re.search(pat, text_all, flags=re.I)
                 if m:
@@ -900,44 +1012,46 @@ class MyHomeExtractor(BaseExtractor):
                         return n
             return None
 
-        rooms = find_int([
+        rooms = find_int2([
             r"(?:Комнат[ыа]|Комнаты)[\s•:–-]*?(\d+)", r"(\d+)\s*room\b", r"(\d+)\s*ოთახ"
         ])
-        bedrooms = find_int([
-            r"Спальн\w*[\s•:–-]*?(\d+)", r"(\d+)\s*bed\b", r"(\d+)\s*საძिनებ\w*"
+        bedrooms = find_int2([
+            r"Спальн\w*[\s•:–-]*?(\d+)", r"(\d+)\s*bed\b", r"(\d+)\s*საძინებ\w*"
         ])
-        bathrooms = find_int([
+        bathrooms = find_int2([
             r"(?:Санузел\w*|С/У)[\s•:–-]*?(\d+)", r"(\d+)\s*bath"
         ])
 
-        def area_by_labels(labels: List[str]) -> Optional[int]:
+        def area_by_labels2(labels: List[str]) -> Optional[int]:
             for lb in labels:
                 m = re.search(rf"{lb}\s*[:\-–]?\s*(\d[\d\s,\.]*)\s*{MEASURE_M2_RU_KA_EN}", text_all, flags=re.I)
                 if m:
                     return extract_first_number(m.group(1))
             return None
 
-        area_m2 = area_by_labels(["სახლის ფართი", "ბინის ფართი", "საერთო ფართი",
+        area_m2 = area_by_labels2(["სახლის ფართი", "ბინის ფართი", "საერთო ფართი",
                                   "Площадь дома", "Площадь квартиры", "Общая площадь", "Площадь",
                                   "House area", "Apartment area", "Total area"])
-        land_area_m2 = area_by_labels(["ეზოს ფართი", "Площадь участка", "Land area", "Lot area"])
+        land_area_m2 = area_by_labels2(["ეზოს ფართი", "Площадь участка", "Land area", "Lot area"])
 
-        # Надёжный fallback: берём РОВНО числа перед m², без склейки "37 60"
+        # Надёжный fallback по m²
         if area_m2 is None or land_area_m2 is None:
             m2s = find_m2_values(text_all)
             if m2s:
                 if area_m2 is None:
                     area_m2 = m2s[0]
-                # если есть второе значение — обычно это участок у домов
                 if land_area_m2 is None and len(m2s) > 1:
                     land_area_m2 = m2s[1]
+        if land_area_m2 == area_m2:
+            land_area_m2 = None
 
         # address + floors
-        addr_line = address_line or self._parse_ru_ka_address_from_text(text_all)
+        if not raw_addr:
+            raw_addr = self._parse_ru_ka_address_from_text(text_all)
+        address_line = to_ru(raw_addr) if raw_addr else None
         floor, floors_total = self._parse_floors(text_all)
         try:
             for blob in captured_json_blobs:
-                # часто попадаются ключи floor / totalFloors / numberOfFloors
                 strs = json.dumps(blob, ensure_ascii=False)
                 m = re.search(r'"(?:floor|floorNumber)"\s*:\s*(\d+)', strs)
                 if m and not floor:
@@ -950,7 +1064,7 @@ class MyHomeExtractor(BaseExtractor):
         except Exception:
             pass
 
-        # Photos: JSON (captured) -> DOM (captured) -> OG -> fallback DOM
+        # Photos
         cand = list(photos)
         cand.extend(captured_json_imgs)
         cand.extend(captured_dom_imgs)
@@ -962,18 +1076,31 @@ class MyHomeExtractor(BaseExtractor):
                 src = img.get("src") or img.get("data-src") or ""
                 if src:
                     cand.append(src)
-
         resolved = [absolutize(self._resolve_next_image(u), self.url) for u in cand]
         photos_ord = uniq_keep_order([u for u in resolved if is_good_image_url(u) and not re.search(r'(?:_thumb|_blur|google_map)', u)])[:10]
 
-        # Phones: tel: + текст + JSON (только из основной части страницы)
+        # Phones
         phones = _phones_from_text(" ".join(a.get("href","") for a in main.select('a[href^="tel:"]')))
         phones.extend(_phones_from_text(text_all))
         for blob in captured_json_blobs:
             for s in _flatten_strings(blob):
                 if any(ch.isdigit() for ch in s):
                     phones.extend(_phones_from_text(s))
-        phones = uniq_keep_order(phones)
+            try:
+                if isinstance(blob, dict):
+                    data = blob.get("data") if isinstance(blob.get("data"), dict) else None
+                    candidates: List[Optional[str]] = []
+                    if isinstance(data, dict):
+                        candidates += [data.get("phone_number"), data.get("phoneNumber"), data.get("phone")]
+                    candidates += [blob.get("phone_number"), blob.get("phoneNumber"), blob.get("phone")]
+                    for val in candidates:
+                        if val:
+                            ph = _normalize_ge_phone(str(val))
+                            if ph:
+                                phones.append(ph)
+            except Exception:
+                pass
+        phones = [p for p in uniq_keep_order(phones) if p not in self.PHONE_BLACKLIST]
 
         return Listing(
             url=self.url,
@@ -981,16 +1108,17 @@ class MyHomeExtractor(BaseExtractor):
             listing_id=listing_id,
             title=title,
             location=location,
-            address_line=address_line or self._parse_ru_ka_address_from_text(text_all),
+            address_line=address_line,
             price=Price(amount=price_amount, currency=price_currency),
             area_m2=area_m2,
             land_area_m2=land_area_m2,
             rooms=rooms,
             bedrooms=bedrooms,
-            description=meta(soup, "og:description") or None,
-            attributes=[],
+            bathrooms=bathrooms,
             floor=floor,
             floors_total=floors_total,
+            description=description or meta(soup, "og:description") or None,
+            attributes=[],
             photos=photos_ord,
             phones=phones,
             raw_meta={"json_ld": jlds},
@@ -1031,7 +1159,7 @@ RU_MAP = {
     "Тбилиси": "Тбилиси",
     "თბილისი": "Тбилиси",
     "Saguramo": "Сагурамо",
-    "საგურამო": "Сагурамო",
+    "საგურამო": "Сагурамо",
 }
 
 def _sym(cur: Optional[str]) -> str:
